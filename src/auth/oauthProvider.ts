@@ -285,6 +285,11 @@ export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
     });
   }
 
+  // Expose the underlying Fortnox token provider (used by MCP tool handlers)
+  getTokenProvider(): DatabaseTokenProvider {
+    return this.tokenProvider;
+  }
+
   // Helper: sign and return access + refresh token pair
   private async issueTokens(
     userId: string,
@@ -323,4 +328,11 @@ export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
       scope,
     };
   }
+}
+
+// Extract the userId (JWT sub claim) from a verified AuthInfo token.
+// The token has already been verified by requireBearerAuth, so we just decode.
+export function getUserIdFromAuth(auth: AuthInfo): string {
+  const claims = jose.decodeJwt(auth.token);
+  return claims.sub as string;
 }
