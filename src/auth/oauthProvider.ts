@@ -15,6 +15,7 @@ import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { ITokenStorage } from "./storage/types.js";
 import { DatabaseTokenProvider } from "./databaseProvider.js";
 import { FORTNOX_SCOPES } from "./credentials.js";
+import { Redis } from "@upstash/redis";
 
 // JWT configuration
 const JWT_ALGORITHM = "HS256";
@@ -38,50 +39,62 @@ interface IssuedCode {
   createdAt: number;
 }
 
-/**
- * MCP OAuth provider that proxies authentication to Fortnox
- *
- * Flow:
- * 1. Claude calls /authorize on this server
- * 2. We redirect to Fortnox OAuth
- * 3. User authorizes in Fortnox
- * 4. Fortnox redirects to our /oauth/fortnox/callback
- * 5. We store Fortnox tokens and redirect back to Claude with our auth code
- * 6. Claude exchanges our auth code for our JWT access token
- * 7. Claude uses our JWT for /mcp requests
- * 8. We verify JWT and use stored Fortnox tokens for API calls
- */
+// Redis-backed clients store — survives cold starts
+class RedisClientsStore implements OAuthRegisteredClientsStore {
+  constructor(private redis: Redis) {}
+
+  async getClient(
+    clientId: string
+  ): Promise<OAuthClientInformationFull | undefined> {
+    const data = await this.redis.get<OAuthClientInformationFull>(
+      `mcp:client:${clientId}`
+    );
+    return data ?? undefined;
+  }
+
+  async registerClient(
+    client: Omit<
+      OAuthClientInformationFull,
+      "client_id" | "client_id_issued_at"
+    >
+  ): Promise<OAuthClientInformationFull> {
+    const clientId = `client_${crypto.randomUUID()}`;
+    const fullClient: OAuthClientInformationFull = {
+      ...client,
+      client_id: clientId,
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+    };
+    await this.redis.set(`mcp:client:${clientId}`, fullClient, {
+      ex: 90 * 24 * 3600,
+    });
+    return fullClient;
+  }
+}
+
 export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
+  private redis: Redis;
   private jwtSecret: Uint8Array;
   private serverUrl: string;
   private tokenProvider: DatabaseTokenProvider;
-  private _clientsStore: InMemoryClientsStore;
-
-  // State storage (should use Redis/DB in production)
-  private pendingAuthorizations: Map<string, PendingAuthorization> = new Map();
-  private issuedCodes: Map<string, IssuedCode> = new Map();
-  private revokedTokens: Set<string> = new Set();
-
-  // Skip local PKCE validation since we handle it ourselves
-  skipLocalPkceValidation = false;
+  private _clientsStore: RedisClientsStore;
 
   constructor(
     jwtSecret: string,
     serverUrl: string,
     tokenStorage: ITokenStorage
   ) {
+    this.redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL!,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+    });
     this.jwtSecret = new TextEncoder().encode(jwtSecret);
     this.serverUrl = serverUrl;
     this.tokenProvider = new DatabaseTokenProvider(tokenStorage);
-    this._clientsStore = new InMemoryClientsStore();
+    this._clientsStore = new RedisClientsStore(this.redis);
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return this._clientsStore;
-  }
-
-  getTokenProvider(): DatabaseTokenProvider {
-    return this.tokenProvider;
   }
 
   async authorize(
@@ -89,66 +102,75 @@ export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
-    // Generate state to link MCP request to Fortnox OAuth
-    const oauthState = crypto.randomUUID();
+    const state = crypto.randomUUID();
+    const codeChallenge = params.codeChallenge ?? "";
 
-    // Store pending authorization
-    this.pendingAuthorizations.set(oauthState, {
+    const pending: PendingAuthorization = {
       mcpClient: client,
       mcpParams: params,
-      codeChallenge: params.codeChallenge,
+      codeChallenge,
       createdAt: Date.now(),
-    });
+    };
 
-    // Clean up old pending authorizations (older than 10 minutes)
-    this.cleanupPendingAuthorizations();
+    // Persist with 10-minute TTL — survives serverless cold starts
+    await this.redis.set(`mcp:pending:${state}`, pending, { ex: 10 * 60 });
 
-    // Redirect to Fortnox OAuth
-    const fortnoxAuthUrl = this.tokenProvider.getAuthorizationUrl(
-      `${this.serverUrl}/oauth/fortnox/callback`,
-      FORTNOX_SCOPES,
-      oauthState
+    const fortnoxAuthUrl = new URL("https://apps.fortnox.se/oauth-v1/auth");
+    fortnoxAuthUrl.searchParams.set(
+      "client_id",
+      process.env.FORTNOX_CLIENT_ID!
     );
+    fortnoxAuthUrl.searchParams.set(
+      "redirect_uri",
+      `${this.serverUrl}/oauth/fortnox/callback`
+    );
+    fortnoxAuthUrl.searchParams.set("scope", FORTNOX_SCOPES.join(" "));
+    fortnoxAuthUrl.searchParams.set("state", state);
+    fortnoxAuthUrl.searchParams.set("response_type", "code");
+    fortnoxAuthUrl.searchParams.set("access_type", "offline");
 
-    res.redirect(fortnoxAuthUrl);
+    res.redirect(fortnoxAuthUrl.toString());
   }
 
+  // Called by /oauth/fortnox/callback route after Fortnox redirects back
   async handleFortnoxCallback(
     code: string,
     state: string
   ): Promise<{ redirectUri: string; code: string; state?: string }> {
     // Look up pending authorization
-    const pending = this.pendingAuthorizations.get(state);
+    const pending = await this.redis.get<PendingAuthorization>(
+      `mcp:pending:${state}`
+    );
     if (!pending) {
       throw new Error("Invalid or expired OAuth state");
     }
 
-    // Remove from pending
-    this.pendingAuthorizations.delete(state);
+    // Remove from pending (single use)
+    await this.redis.del(`mcp:pending:${state}`);
 
-    // Exchange Fortnox code for tokens
     // Generate a unique user ID based on client ID and a random component
     const userId = `${pending.mcpClient.client_id}:${crypto.randomUUID()}`;
 
+    // Exchange Fortnox code for tokens and store them
     await this.tokenProvider.exchangeAuthorizationCode(
       code,
       `${this.serverUrl}/oauth/fortnox/callback`,
       userId
     );
 
-    // Issue our own authorization code
+    // Issue our own MCP authorization code
     const mcpAuthCode = crypto.randomUUID();
-    this.issuedCodes.set(mcpAuthCode, {
+    const issued: IssuedCode = {
       userId,
       clientId: pending.mcpClient.client_id,
       codeChallenge: pending.codeChallenge,
       redirectUri: pending.mcpParams.redirectUri,
       scopes: pending.mcpParams.scopes || [],
       createdAt: Date.now(),
-    });
+    };
 
-    // Clean up old codes
-    this.cleanupIssuedCodes();
+    // Persist with 5-minute TTL
+    await this.redis.set(`mcp:code:${mcpAuthCode}`, issued, { ex: 5 * 60 });
 
     return {
       redirectUri: pending.mcpParams.redirectUri,
@@ -161,7 +183,9 @@ export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<string> {
-    const issued = this.issuedCodes.get(authorizationCode);
+    const issued = await this.redis.get<IssuedCode>(
+      `mcp:code:${authorizationCode}`
+    );
     if (!issued) {
       throw new Error("Invalid authorization code");
     }
@@ -175,70 +199,80 @@ export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
     _redirectUri?: string,
     _resource?: URL
   ): Promise<OAuthTokens> {
-    const issued = this.issuedCodes.get(authorizationCode);
+    const issued = await this.redis.get<IssuedCode>(
+      `mcp:code:${authorizationCode}`
+    );
     if (!issued) {
       throw new Error("Invalid authorization code");
     }
 
-    // Verify client
+    // Verify client matches
     if (issued.clientId !== client.client_id) {
-      throw new Error("Client mismatch");
+      throw new Error("Authorization code was not issued to this client");
     }
 
-    // Remove used code
-    this.issuedCodes.delete(authorizationCode);
+    // Delete code — single use
+    await this.redis.del(`mcp:code:${authorizationCode}`);
 
-    // Check if code is expired (5 minutes)
-    if (Date.now() - issued.createdAt > 5 * 60 * 1000) {
-      throw new Error("Authorization code expired");
-    }
-
-    // Issue JWT tokens
-    return this.issueTokens(issued.userId, issued.clientId, issued.scopes);
+    return this.issueTokens(issued.userId, client.client_id, issued.scopes);
   }
 
   async exchangeRefreshToken(
     client: OAuthClientInformationFull,
     refreshToken: string,
-    scopes?: string[],
-    _resource?: URL
+    _scopes?: string[]
   ): Promise<OAuthTokens> {
-    // Verify refresh token
-    const payload = await this.verifyToken(refreshToken, "refresh");
-
-    if (payload.clientId !== client.client_id) {
-      throw new Error("Client mismatch");
-    }
-
     // Check if revoked
-    if (this.revokedTokens.has(refreshToken)) {
-      throw new Error("Token has been revoked");
+    const isRevoked = await this.redis.exists(`mcp:revoked:${refreshToken}`);
+    if (isRevoked) {
+      throw new Error("Refresh token has been revoked");
     }
 
-    // Issue new tokens
-    return this.issueTokens(
-      payload.userId,
-      payload.clientId,
-      scopes || payload.scopes
-    );
+    let payload: jose.JWTPayload;
+    try {
+      const result = await jose.jwtVerify(refreshToken, this.jwtSecret);
+      payload = result.payload;
+    } catch {
+      throw new Error("Invalid refresh token");
+    }
+
+    if (payload["client_id"] !== client.client_id) {
+      throw new Error("Refresh token was not issued to this client");
+    }
+
+    const userId = payload.sub as string;
+    const scopes = ((payload["scope"] as string) ?? "")
+      .split(" ")
+      .filter(Boolean);
+
+    // Revoke the old refresh token
+    await this.redis.set(`mcp:revoked:${refreshToken}`, 1, {
+      ex: REFRESH_TOKEN_EXPIRES_IN,
+    });
+
+    return this.issueTokens(userId, client.client_id, scopes);
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     // Check if revoked
-    if (this.revokedTokens.has(token)) {
-      throw new Error("Token has been revoked");
+    const isRevoked = await this.redis.exists(`mcp:revoked:${token}`);
+    if (isRevoked) {
+      throw new Error("Access token has been revoked");
     }
 
-    const payload = await this.verifyToken(token, "access");
+    let payload: jose.JWTPayload;
+    try {
+      const result = await jose.jwtVerify(token, this.jwtSecret);
+      payload = result.payload;
+    } catch {
+      throw new Error("Invalid access token");
+    }
 
     return {
       token,
-      clientId: payload.clientId,
-      scopes: payload.scopes,
+      clientId: payload["client_id"] as string,
+      scopes: ((payload["scope"] as string) ?? "").split(" ").filter(Boolean),
       expiresAt: payload.exp,
-      extra: {
-        userId: payload.userId,
-      },
     };
   }
 
@@ -246,129 +280,47 @@ export class FortnoxProxyOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest
   ): Promise<void> {
-    this.revokedTokens.add(request.token);
+    await this.redis.set(`mcp:revoked:${request.token}`, 1, {
+      ex: REFRESH_TOKEN_EXPIRES_IN,
+    });
   }
 
+  // Helper: sign and return access + refresh token pair
   private async issueTokens(
     userId: string,
     clientId: string,
     scopes: string[]
   ): Promise<OAuthTokens> {
     const now = Math.floor(Date.now() / 1000);
+    const scope = scopes.length > 0 ? scopes.join(" ") : FORTNOX_SCOPES.join(" ");
 
-    // Create access token
     const accessToken = await new jose.SignJWT({
-      userId,
-      clientId,
-      scopes,
-      type: "access",
+      sub: userId,
+      client_id: clientId,
+      scope,
     })
       .setProtectedHeader({ alg: JWT_ALGORITHM })
-      .setIssuedAt()
+      .setIssuedAt(now)
       .setExpirationTime(now + ACCESS_TOKEN_EXPIRES_IN)
-      .setIssuer(this.serverUrl)
       .sign(this.jwtSecret);
 
-    // Create refresh token
     const refreshToken = await new jose.SignJWT({
-      userId,
-      clientId,
-      scopes,
-      type: "refresh",
+      sub: userId,
+      client_id: clientId,
+      scope,
+      token_type: "refresh",
     })
       .setProtectedHeader({ alg: JWT_ALGORITHM })
-      .setIssuedAt()
+      .setIssuedAt(now)
       .setExpirationTime(now + REFRESH_TOKEN_EXPIRES_IN)
-      .setIssuer(this.serverUrl)
       .sign(this.jwtSecret);
 
     return {
       access_token: accessToken,
-      token_type: "Bearer",
+      token_type: "bearer",
       expires_in: ACCESS_TOKEN_EXPIRES_IN,
       refresh_token: refreshToken,
-      scope: scopes.join(" "),
+      scope,
     };
   }
-
-  private async verifyToken(
-    token: string,
-    expectedType: "access" | "refresh"
-  ): Promise<{
-    userId: string;
-    clientId: string;
-    scopes: string[];
-    exp: number;
-  }> {
-    try {
-      const { payload } = await jose.jwtVerify(token, this.jwtSecret, {
-        issuer: this.serverUrl,
-      });
-
-      if (payload.type !== expectedType) {
-        throw new Error(`Expected ${expectedType} token`);
-      }
-
-      return {
-        userId: payload.userId as string,
-        clientId: payload.clientId as string,
-        scopes: payload.scopes as string[],
-        exp: payload.exp as number,
-      };
-    } catch (error) {
-      if (error instanceof jose.errors.JWTExpired) {
-        throw new Error("Token expired");
-      }
-      throw new Error("Invalid token");
-    }
-  }
-
-  private cleanupPendingAuthorizations(): void {
-    const maxAge = 10 * 60 * 1000; // 10 minutes
-    const now = Date.now();
-
-    for (const [state, pending] of this.pendingAuthorizations) {
-      if (now - pending.createdAt > maxAge) {
-        this.pendingAuthorizations.delete(state);
-      }
-    }
-  }
-
-  private cleanupIssuedCodes(): void {
-    const maxAge = 5 * 60 * 1000; // 5 minutes
-    const now = Date.now();
-
-    for (const [code, issued] of this.issuedCodes) {
-      if (now - issued.createdAt > maxAge) {
-        this.issuedCodes.delete(code);
-      }
-    }
-  }
-}
-
-// Dynamic client registration store
-class InMemoryClientsStore implements OAuthRegisteredClientsStore {
-  private clients: Map<string, OAuthClientInformationFull> = new Map();
-
-  getClient(clientId: string): OAuthClientInformationFull | undefined {
-    return this.clients.get(clientId);
-  }
-
-  registerClient(
-    client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">
-  ): OAuthClientInformationFull {
-    const clientId = `client_${crypto.randomUUID()}`;
-    const fullClient: OAuthClientInformationFull = {
-      ...client,
-      client_id: clientId,
-      client_id_issued_at: Math.floor(Date.now() / 1000),
-    };
-
-    this.clients.set(clientId, fullClient);
-    return fullClient;
-  }
-}
-
-export function getUserIdFromAuth(auth: AuthInfo): string | undefined {
-  return auth.extra?.userId as string | undefined;
 }
