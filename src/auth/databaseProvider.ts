@@ -22,16 +22,12 @@ export class DatabaseTokenProvider implements ITokenProvider {
     if (!userId) {
       throw new AuthRequiredError();
     }
-
     const tokens = await this.storage.get(userId);
     if (!tokens) {
       throw new AuthRequiredError(userId);
     }
-
     const needsRefresh = Date.now() >= tokens.expiresAt - TOKEN_REFRESH_BUFFER_MS;
-
     if (needsRefresh || !tokens.accessToken) {
-      // Deduplicate concurrent refresh requests per user
       if (!this.refreshPromises.has(userId)) {
         const promise = this.refreshAccessToken(userId, tokens).finally(() => {
           this.refreshPromises.delete(userId);
@@ -40,18 +36,14 @@ export class DatabaseTokenProvider implements ITokenProvider {
       }
       return this.refreshPromises.get(userId)!;
     }
-
     return tokens.accessToken;
   }
 
   isAuthenticated(userId?: string): boolean {
-    // For async storage, we can't check synchronously
-    // Return true and let getAccessToken throw if not authenticated
     return !!userId;
   }
 
   getTokenInfo(userId?: string): TokenInfo | null {
-    // For async storage, return null (caller should use async methods)
     return null;
   }
 
@@ -75,14 +67,10 @@ export class DatabaseTokenProvider implements ITokenProvider {
     const tokenUrl = `${FORTNOX_OAUTH_URL}/token`;
     const auth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString("base64");
 
+    console.log('[TokenExchange] Starting, redirectUri:', redirectUri);
+
     try {
-      const response = await axios.post<{
-        access_token: string;
-        refresh_token: string;
-        token_type: string;
-        expires_in: number;
-        scope: string;
-      }>(
+      const response = await axios.post(
         tokenUrl,
         new URLSearchParams({
           grant_type: "authorization_code",
@@ -90,10 +78,12 @@ export class DatabaseTokenProvider implements ITokenProvider {
           redirect_uri: redirectUri
         }),
         {
+          adapter: "http",
           headers: {
             "Authorization": `Basic ${auth}`,
             "Content-Type": "application/x-www-form-urlencoded"
-          }
+          },
+          timeout: 15000
         }
       );
 
@@ -105,8 +95,16 @@ export class DatabaseTokenProvider implements ITokenProvider {
       };
 
       await this.storeTokens(userId, tokens);
+      console.log('[TokenExchange] Success');
       return tokens;
     } catch (error) {
+      console.error('[TokenExchange] Error:', error?.constructor?.name, error instanceof Error ? error.message : String(error));
+      if (error instanceof Error && (error as any).cause) {
+        console.error('[TokenExchange] Cause:', (error as any).cause);
+      }
+      if (error instanceof AxiosError) {
+        console.error('[TokenExchange] HTTP status:', error.response?.status, JSON.stringify(error.response?.data));
+      }
       throw this.handleAuthError(error, "Failed to exchange authorization code");
     }
   }
@@ -120,23 +118,19 @@ export class DatabaseTokenProvider implements ITokenProvider {
     const auth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString("base64");
 
     try {
-      const response = await axios.post<{
-        access_token: string;
-        refresh_token: string;
-        token_type: string;
-        expires_in: number;
-        scope: string;
-      }>(
+      const response = await axios.post(
         tokenUrl,
         new URLSearchParams({
           grant_type: "refresh_token",
           refresh_token: tokens.refreshToken
         }),
         {
+          adapter: "http",
           headers: {
             "Authorization": `Basic ${auth}`,
             "Content-Type": "application/x-www-form-urlencoded"
-          }
+          },
+          timeout: 15000
         }
       );
 
@@ -150,7 +144,6 @@ export class DatabaseTokenProvider implements ITokenProvider {
       await this.storeTokens(userId, newTokens);
       return newTokens.accessToken;
     } catch (error) {
-      // Clear invalid tokens
       await this.storage.delete(userId);
       throw this.handleAuthError(error, "Failed to refresh access token");
     }
@@ -178,21 +171,21 @@ export class DatabaseTokenProvider implements ITokenProvider {
       const data = error.response?.data;
 
       if (status === 401) {
-        return new Error(
-          `${context}: Invalid credentials. Check Fortnox client configuration.`
-        );
+        return new Error(`${context}: Invalid credentials.`);
       }
+
       if (status === 400) {
         const errorDesc = data?.error_description || data?.error || "Bad request";
-        return new Error(
-          `${context}: ${errorDesc}. The refresh token may be expired or revoked.`
-        );
+        return new Error(`${context}: ${errorDesc}.`);
       }
-      return new Error(
-        `${context}: API error ${status} - ${JSON.stringify(data)}`
-      );
+
+      const cause = (error as any).cause instanceof Error ? (error as any).cause.message : '';
+      return new Error(`${context}: HTTP ${status ?? 'network'} - ${JSON.stringify(data) || cause || error.message}`);
     }
 
-    return new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`);
+    const causeMsg = (error instanceof Error && (error as any).cause)
+      ? ' cause=' + ((error as any).cause instanceof Error ? (error as any).cause.message : String((error as any).cause))
+      : '';
+    return new Error(`${context}: ${error instanceof Error ? error.message : String(error)}${causeMsg}`);
   }
 }
