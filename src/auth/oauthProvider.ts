@@ -52,22 +52,19 @@ class RedisClientsStore implements OAuthRegisteredClientsStore {
     return data ?? undefined;
   }
 
+  // SDK generates client_id before calling; we just persist and return
   async registerClient(
-    client: Omit<
-      OAuthClientInformationFull,
-      "client_id" | "client_id_issued_at"
-    >
+    client: OAuthClientInformationFull
   ): Promise<OAuthClientInformationFull> {
-    const clientId = `client_${crypto.randomUUID()}`;
-    const fullClient: OAuthClientInformationFull = {
-      ...client,
-      client_id: clientId,
-      client_id_issued_at: Math.floor(Date.now() / 1000),
-    };
-    await this.redis.set(`mcp:client:${clientId}`, fullClient, {
-      ex: 90 * 24 * 3600,
-    });
-    return fullClient;
+    try {
+      await this.redis.set(`mcp:client:${client.client_id}`, client, {
+        ex: 90 * 24 * 3600,
+      });
+      return client;
+    } catch (error) {
+      console.error("[Redis] registerClient failed:", error);
+      throw error;
+    }
   }
 }
 
